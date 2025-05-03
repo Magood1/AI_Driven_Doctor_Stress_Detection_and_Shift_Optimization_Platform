@@ -1,0 +1,477 @@
+# @title <<< Step 1: Dataset Acquisition and Preprocessing (Refined) >>>
+
+# --- 1.0. Imports and Setup ---
+import os
+import sys
+import json
+import zipfile
+import subprocess # For running shell commands like kaggle CLI
+import random
+import shutil
+import time
+import datetime
+from pathlib import Path
+from getpass import getpass # For safer key handling in Colab
+
+import pandas as pd
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import PIL.Image
+import io
+
+# Image Processing & ML/DL Prep
+import mediapipe as mp
+import albumentations as A
+from albumentations.pytorch import ToTensorV2 # For PyTorch integration
+# We will use PyTorch based on user's provided snippets (torch.onnx.export)
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms # For alternative/simpler transforms if needed
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+
+print(f"PyTorch Version: {torch.__version__}")
+print(f"CUDA Available: {torch.cuda.is_available()}")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# --- Configuration ---
+DATA_DIR = Path("./data")
+# Define specific subdirectories based on user's download list
+FER2013_DIR = DATA_DIR / "fer2013"
+AFFECTNET_DIR = DATA_DIR / "affectnet"
+RAFDB_DIR = DATA_DIR / "raf-db"
+STRESS_FACES_DIR = DATA_DIR / "stress-faces"
+
+# Create base data directory
+DATA_DIR.mkdir(exist_ok=True)
+
+SEED = 42
+IMG_HEIGHT = 224 # Standard input size for many models
+IMG_WIDTH = 224
+IMG_SIZE = (IMG_HEIGHT, IMG_WIDTH)
+
+# Set random seeds
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# --- 1.1. Kaggle API Authentication ---
+# Use environment variables or Colab secrets for security
+# (Re-using the secure input method from the previous notebook)
+print("--- Setting up Kaggle API ---")
+if 'KAGGLE_USERNAME' not in os.environ:
+  try:
+      from google.colab import userdata
+      os.environ['KAGGLE_USERNAME'] = userdata.get('KAGGLE_USERNAME')
+      if not os.environ['KAGGLE_USERNAME']:
+          os.environ['KAGGLE_USERNAME'] = getpass('Enter Kaggle Username: ')
+          print("Kaggle Username entered via getpass.")
+      else:
+          print("Kaggle Username loaded from Colab Secrets.")
+  except ImportError:
+      os.environ['KAGGLE_USERNAME'] = getpass('Enter Kaggle Username: ')
+      print("Kaggle Username entered via getpass (Colab Secrets not available).")
+
+if 'KAGGLE_KEY' not in os.environ:
+  try:
+      from google.colab import userdata
+      os.environ['KAGGLE_KEY'] = userdata.get('KAGGLE_KEY')
+      if not os.environ['KAGGLE_KEY']:
+          os.environ['KAGGLE_KEY'] = getpass('Enter Kaggle Key: ')
+          print("Kaggle Key entered via getpass.")
+      else:
+          print("Kaggle Key loaded from Colab Secrets.")
+  except ImportError:
+      os.environ['KAGGLE_KEY'] = getpass('Enter Kaggle Key: ')
+      print("Kaggle Key entered via getpass (Colab Secrets not available).")
+
+
+# Ensure kaggle command is available and configured
+try:
+    # Check if kaggle CLI is installed
+    subprocess.run(['kaggle', '--version'], check=True, capture_output=True)
+
+    # Configure Kaggle authentication if keys are provided
+    if 'KAGGLE_USERNAME' in os.environ and 'KAGGLE_KEY' in os.environ:
+        KAGGLE_CONFIG_DIR = Path.home() / '.kaggle'
+        KAGGLE_CONFIG_DIR.mkdir(exist_ok=True)
+        KAGGLE_JSON_PATH = KAGGLE_CONFIG_DIR / 'kaggle.json'
+        kaggle_credentials = {
+            "username": os.environ['KAGGLE_USERNAME'],
+            "key": os.environ['KAGGLE_KEY']
+        }
+        with open(KAGGLE_JSON_PATH, 'w') as f:
+            json.dump(kaggle_credentials, f)
+        KAGGLE_JSON_PATH.chmod(0o600) # Set permissions
+        print("Kaggle API configured successfully.")
+    else:
+        print("Warning: Kaggle credentials not fully provided. Downloads might fail.")
+        print("Ensure you have manually uploaded kaggle.json or configured secrets.")
+
+except (subprocess.CalledProcessError, FileNotFoundError):
+    print("Error: Kaggle CLI not found or not working.")
+    print("Please install it: !pip install kaggle")
+    # Set a flag to skip downloads if Kaggle isn't working
+    kaggle_available = False
+else:
+    kaggle_available = True
+
+# --- 1.2. Dataset Download ---
+def download_and_extract(dataset_slug, target_dir):
+    """Downloads a Kaggle dataset and extracts it to the target directory."""
+    if not kaggle_available:
+        print(f"Skipping download of {dataset_slug} (Kaggle CLI unavailable).")
+        return False
+    if target_dir.exists() and any(target_dir.iterdir()):
+         print(f"Directory {target_dir} already exists and is not empty. Skipping download.")
+         return True # Assume already downloaded and extracted
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    zip_file = DATA_DIR / f"{dataset_slug.split('/')[-1]}.zip"
+    download_command = [
+        'kaggle', 'datasets', 'download',
+        '-d', dataset_slug,
+        '-p', str(DATA_DIR),
+        '--force' # Overwrite zip if it exists but extraction failed before
+    ]
+    print(f"\nDownloading {dataset_slug}...")
+    try:
+        process = subprocess.run(download_command, check=True, capture_output=True, text=True)
+        print("Download Output:", process.stdout)
+        print("Download successful.")
+
+        print(f"Extracting {zip_file} to {target_dir}...")
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            zip_ref.extractall(target_dir)
+        print("Extraction complete.")
+        # Optional: Remove zip file after extraction
+        # zip_file.unlink()
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error downloading {dataset_slug}: {e}")
+        print("Stderr:", e.stderr)
+        # Check for common issues
+        if "404" in e.stderr:
+            print("Hint: Dataset not found. Check the slug/URL.")
+        if "403" in e.stderr or "401" in e.stderr:
+            print("Hint: Authentication error. Check Kaggle username/key.")
+        if "429" in e.stderr:
+             print("Hint: Too many requests. Wait and try again.")
+        return False
+    except FileNotFoundError:
+         print(f"Error: Zip file {zip_file} not found after download command. Check download path.")
+         return False
+    except zipfile.BadZipFile:
+        print(f"Error: Bad zip file for {dataset_slug}. Download may be corrupt.")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred during download/extraction: {e}")
+        return False
+
+# Download datasets specified in the user's list
+datasets_to_download = {
+    "msambare/fer2013": FER2013_DIR,
+    "noamsegal/affectnet-training-data": AFFECTNET_DIR, # Kaggle mirror subset
+    # "shuvoalok/raf-db-dataset": RAFDB_DIR, # Requires login / might fail directly
+    "janithukwattage/stress-faces-dataset": STRESS_FACES_DIR
+}
+
+download_status = {}
+for slug, path in datasets_to_download.items():
+    # Special handling for RAF-DB if needed (e.g., manual download instructions)
+    if "raf-db" in slug:
+        print("\nNote: RAF-DB often requires manual download request.")
+        print(f"Please download from http://www.whdeng.cn/RAF/model1.html and place contents in {path}")
+        path.mkdir(parents=True, exist_ok=True) # Create dir anyway
+        download_status[slug] = False # Indicate manual action needed
+        continue # Skip automatic download attempt for RAF-DB
+
+    status = download_and_extract(slug, path)
+    download_status[slug] = status
+
+print("\nDataset download summary:", download_status)
+
+# --- 1.3. Preprocessing Functions ---
+
+# Initialize MediaPipe Face Mesh
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=True,     # Process images independently
+    max_num_faces=1,            # Focus on the most prominent face
+    refine_landmarks=True,      # Get more precise landmarks (lips, eyes, iris) -> 478 landmarks
+    min_detection_confidence=0.5) # Minimum confidence for face detection
+
+def detect_face_and_landmarks_mediapipe(image_bgr):
+    """
+    Detects face using MediaPipe FaceMesh and returns landmarks and bounding box.
+
+    Args:
+        image_bgr: Input image in BGR format (OpenCV default).
+
+    Returns:
+        A tuple (landmarks, bounding_box, face_image_cropped) or (None, None, None) if no face detected.
+        landmarks: NumPy array of shape (478, 3) with [x, y, z] coordinates normalized to [0, 1].
+                   Returns None if no landmarks found.
+        bounding_box: Tuple (x_min, y_min, width, height) in absolute pixel coordinates.
+                      Returns None if no face detected.
+        face_image_cropped: The BGR image cropped to the bounding box.
+                            Returns None if no face detected.
+    """
+    h, w = image_bgr.shape[:2]
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(image_rgb)
+
+    if not results.multi_face_landmarks:
+        return None, None, None
+
+    # --- Extract Landmarks ---
+    face_landmarks = results.multi_face_landmarks[0] # Assuming max_num_faces=1
+    landmarks_np = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks.landmark]) # Shape (478, 3)
+
+    # --- Calculate Bounding Box from Landmarks ---
+    # Use min/max x, y coordinates of landmarks for a tight box
+    x_coords = landmarks_np[:, 0]
+    y_coords = landmarks_np[:, 1]
+    x_min, x_max = np.min(x_coords), np.max(x_coords)
+    y_min, y_max = np.min(y_coords), np.max(y_coords)
+
+    # Convert normalized coordinates to absolute pixel values
+    bbox_x_min = int(x_min * w)
+    bbox_y_min = int(y_min * h)
+    bbox_x_max = int(x_max * w)
+    bbox_y_max = int(y_max * h)
+
+    # Add some padding (optional)
+    padding = 0.05 # 5% padding
+    bbox_w = bbox_x_max - bbox_x_min
+    bbox_h = bbox_y_max - bbox_y_min
+    pad_w = int(bbox_w * padding)
+    pad_h = int(bbox_h * padding)
+
+    # Apply padding and ensure bounds stay within image dimensions
+    final_x_min = max(0, bbox_x_min - pad_w)
+    final_y_min = max(0, bbox_y_min - pad_h)
+    final_x_max = min(w, bbox_x_max + pad_w)
+    final_y_max = min(h, bbox_y_max + pad_h)
+
+    final_w = final_x_max - final_x_min
+    final_h = final_y_max - final_y_min
+
+    if final_w <= 0 or final_h <= 0:
+        return landmarks_np, None, None # Return landmarks even if bbox is invalid
+
+    bounding_box = (final_x_min, final_y_min, final_w, final_h)
+
+    # --- Crop Face ---
+    face_image_cropped = image_bgr[final_y_min:final_y_max, final_x_min:final_x_max]
+
+    if face_image_cropped.size == 0:
+       return landmarks_np, bounding_box, None # Return landmarks & bbox even if crop failed
+
+    return landmarks_np, bounding_box, face_image_cropped
+
+
+def estimate_rppg_placeholder(face_video_frames_bgr):
+    """
+    Placeholder for rPPG estimation.
+    In reality, this requires a sequence of frames and complex signal processing.
+
+    Args:
+        face_video_frames_bgr: List or array of BGR face frames (sequence).
+
+    Returns:
+        dict: Dictionary with simulated physiological signals (e.g., estimated HR).
+    """
+    if not isinstance(face_video_frames_bgr, (list, np.ndarray)) or len(face_video_frames_bgr) < 10:
+        # Need a sequence of frames for real rPPG
+        return {"estimated_hr": None, "hrv_metric": None, "message": "Insufficient frames for rPPG"}
+
+    # --- Simulation ---
+    # Simulate based on number of frames or random noise
+    simulated_hr = np.random.uniform(60, 90) # Beats per minute
+    simulated_sdnn = np.random.uniform(30, 80) # HRV metric example
+
+    print("Warning: Using placeholder rPPG estimation.")
+    return {"estimated_hr": simulated_hr, "hrv_metric": simulated_sdnn, "message": "Simulated rPPG"}
+
+
+# --- 1.4. Data Augmentation ---
+# Define augmentations using Albumentations (integrates well with PyTorch)
+
+# Augmentations for Training
+train_transform = A.Compose([
+    A.Resize(height=IMG_HEIGHT, width=IMG_WIDTH, interpolation=cv2.INTER_LINEAR),
+    A.HorizontalFlip(p=0.5),
+    A.Rotate(limit=15, p=0.3, border_mode=cv2.BORDER_CONSTANT),
+    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+    A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.3),
+    A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
+    A.MotionBlur(blur_limit=7, p=0.2),
+    # A.CoarseDropout(max_holes=8, max_height=int(IMG_HEIGHT*0.1), max_width=int(IMG_WIDTH*0.1), p=0.2), # Cutout
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), # ImageNet normalization
+    ToTensorV2() # Convert to PyTorch tensor C, H, W
+])
+
+# Augmentations for Validation/Testing (only resize, normalize, convert to tensor)
+val_test_transform = A.Compose([
+    A.Resize(height=IMG_HEIGHT, width=IMG_WIDTH, interpolation=cv2.INTER_LINEAR),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+
+
+# GAN-based Augmentation (Placeholder Function)
+def augment_with_gan(images, labels):
+    """ Placeholder for GAN-based augmentation techniques. """
+    print("Note: GAN-based augmentation requires separate training/loading of a GAN model (e.g., StyleGAN, CycleGAN).")
+    # This function would typically:
+    # 1. Load a pre-trained GAN.
+    # 2. Select minority class samples (e.g., high stress).
+    # 3. Generate synthetic samples using the GAN.
+    # 4. Combine original and synthetic samples.
+    return images, labels
+
+
+# --- 1.5. Data Loading and Preparation (Example: Stress Faces Dataset) ---
+# Create a custom PyTorch Dataset class
+
+class FaceStressDataset(Dataset):
+    def __init__(self, image_paths, labels, transform=None):
+        """
+        Args:
+            image_paths (list): List of paths to images.
+            labels (list or np.array): List of corresponding labels.
+            transform (callable, optional): Optional transform to be applied on a sample.
+        """
+        self.image_paths = image_paths
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        img_path = self.image_paths[idx]
+        try:
+            # Load image using OpenCV (consistent BGR format)
+            image = cv2.imread(str(img_path))
+            if image is None:
+                print(f"Warning: Unable to read image {img_path}. Skipping.")
+                # Return a dummy sample or raise error
+                # For simplicity, return None, handle in collate_fn or dataloader loop
+                return None, None # Indicate failure to load
+
+            # Optional: Face Detection/Cropping here if not done beforehand
+            # landmarks, bbox, face_image = detect_face_and_landmarks_mediapipe(image)
+            # if face_image is not None and face_image.size > 0:
+            #    image = face_image # Use cropped face if successful
+
+            # Ensure image is in RGB for Albumentations (most models expect RGB)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            label = int(self.labels[idx]) # Ensure label is integer
+
+            if self.transform:
+                # Albumentations expects keyword 'image='
+                augmented = self.transform(image=image)
+                image = augmented['image'] # Output is PyTorch Tensor C, H, W
+
+            return image, label # Return tensor image and integer label
+
+        except Exception as e:
+            print(f"Error processing image {img_path}: {e}")
+            return None, None # Indicate failure
+
+
+# Example: Load data from the Stress Faces Dataset
+if download_status.get("janithukwattage/stress-faces-dataset", False):
+    print("\n--- Loading Stress Faces Dataset ---")
+    all_image_paths = list(STRESS_FACES_DIR.glob('**/*.png')) # Find all png images recursively
+    # Extract labels from parent directory name (assuming 'Level_0', 'Level_1', etc.)
+    all_labels = [int(p.parent.name.split('_')[-1]) for p in all_image_paths]
+
+    print(f"Found {len(all_image_paths)} images.")
+    if len(all_image_paths) > 0:
+      unique_labels, counts = np.unique(all_labels, return_counts=True)
+      print("Label distribution:", dict(zip(unique_labels, counts)))
+
+      # Split data (Stratified): 70% train, 15% val, 15% test
+      train_paths, temp_paths, train_labels, temp_labels = train_test_split(
+          all_image_paths, all_labels, test_size=0.3, random_state=SEED, stratify=all_labels
+      )
+      val_paths, test_paths, val_labels, test_labels = train_test_split(
+          temp_paths, temp_labels, test_size=0.5, random_state=SEED, stratify=temp_labels
+      )
+
+      print(f"Train samples: {len(train_paths)}, Val samples: {len(val_paths)}, Test samples: {len(test_paths)}")
+
+      # Create Datasets
+      train_dataset = FaceStressDataset(train_paths, train_labels, transform=train_transform)
+      val_dataset = FaceStressDataset(val_paths, val_labels, transform=val_test_transform)
+      test_dataset = FaceStressDataset(test_paths, test_labels, transform=val_test_transform)
+
+      # --- Create DataLoaders ---
+      # Define a collate function to handle potential None values from dataset __getitem__
+      def collate_fn_skip_error(batch):
+          # Filter out None samples
+          batch = list(filter(lambda x: x is not None and x[0] is not None, batch))
+          if not batch: # If all samples in batch failed
+             return None, None # Return None to indicate empty batch
+          # Unzip the batch
+          images, labels = zip(*batch)
+          # Stack images and convert labels to tensor
+          images = torch.stack(images, 0)
+          labels = torch.tensor(labels, dtype=torch.long) # Use LongTensor for CrossEntropyLoss
+          return images, labels
+
+      BATCH_SIZE = 32 # Define batch size
+      train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True, collate_fn=collate_fn_skip_error)
+      val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate_fn_skip_error)
+      test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate_fn_skip_error)
+
+      print("\nPyTorch DataLoaders created.")
+
+      # Optional: Visualize some augmented samples
+      print("Visualizing some augmented training samples...")
+      images, labels = next(iter(train_loader)) # Get a batch
+      if images is not None:
+          plt.figure(figsize=(12, 6))
+          for i in range(min(5, len(images))):
+              img = images[i].permute(1, 2, 0).numpy() # Convert back to H, W, C for display
+              # Un-normalize for visualization (approximate)
+              mean = np.array([0.485, 0.456, 0.406])
+              std = np.array([0.229, 0.224, 0.225])
+              img = std * img + mean
+              img = np.clip(img, 0, 1)
+              plt.subplot(1, 5, i + 1)
+              plt.imshow(img)
+              plt.title(f"Label: {labels[i].item()}")
+              plt.axis('off')
+          plt.suptitle("Augmented Training Samples (Stress Faces)")
+          plt.show()
+      else:
+           print("Could not retrieve a valid batch from train_loader.")
+
+
+    else:
+      print("No images found in Stress Faces directory. Cannot create datasets/loaders.")
+      train_loader, val_loader, test_loader = None, None, None
+
+else:
+    print("\nStress Faces dataset not downloaded or found. Skipping dataset preparation.")
+    train_loader, val_loader, test_loader = None, None, None
+
+
+# Similar loading logic would be needed for FER2013, AffectNet, RAF-DB,
+# potentially combining them into a larger dataset. This often involves
+# mapping different label schemes (e.g., 7 emotions -> 4 stress levels)
+# and handling different data formats (CSV vs image folders).
+
+print("\n--- Step 1: Dataset Acquisition and Preprocessing Complete ---")
